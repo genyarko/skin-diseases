@@ -5,229 +5,232 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, WeightedRandomSampler
-import numpy as np
+from torch.utils.data import DataLoader
 import timm
 
-from timm.data import create_transform, Mixup
-from timm.loss import SoftTargetCrossEntropy
+from timm.utils import ModelEmaV2
 
 # ==============================================================================
-# 0. Automatic Dataset Download
+# 0. Dataset Download
 # ==============================================================================
 KAGGLE_DATASET = "merolavtechnology/dermnet-skin40-cleaned-dataset"
-BASE_EXTRACT_DIR = "./dermnet-skin40-cleaned-dataset" 
+BASE_EXTRACT_DIR = "./dermnet-skin40-cleaned-dataset"
 DATA_DIR = os.path.join(BASE_EXTRACT_DIR, "kaggle/working/Merged_Dermnet_Skin40")
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 TEST_DIR = os.path.join(DATA_DIR, "test")
 
 if not os.path.exists(TRAIN_DIR):
-    if not os.path.exists(BASE_EXTRACT_DIR):
-        print(f"Downloading {KAGGLE_DATASET} from Kaggle...")
-        try:
-            subprocess.run(["kaggle", "datasets", "download", "-d", KAGGLE_DATASET], check=True)
-            zip_filename = f"{KAGGLE_DATASET.split('/')[-1]}.zip"
-            with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
-                zip_ref.extractall(BASE_EXTRACT_DIR)
-            os.remove(zip_filename)
-        except Exception as e:
-            print(f"🚨 Failed to download dataset: {e}")
-            exit(1)
+    print("Downloading dataset...")
+    subprocess.run(["kaggle", "datasets", "download", "-d", KAGGLE_DATASET], check=True)
+    zip_filename = f"{KAGGLE_DATASET.split('/')[-1]}.zip"
+    with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
+        zip_ref.extractall(BASE_EXTRACT_DIR)
+    os.remove(zip_filename)
 
 # ==============================================================================
-# 1. ROCm / AMD GPU Setup
+# 1. Device
 # ==============================================================================
-os.environ["HIP_VISIBLE_DEVICES"] = "0"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"\nUsing device: {device}")
+print(f"Using device: {device}")
 
 # ==============================================================================
 # 2. Hyperparameters
 # ==============================================================================
-BATCH_SIZE = 128  
-PHASE_1_EPOCHS = 0  
-PHASE_2_EPOCHS = 30 
-HEAD_LR = 5e-4      
-BACKBONE_LR = 1e-5  
-EARLY_STOPPING_PATIENCE = 5  # Number of epochs to wait for improvement before stopping
+BATCH_SIZE = 32
+IMG_SIZE = 384
+EPOCHS_PHASE1 = 5
+EPOCHS_PHASE2 = 40
+
+HEAD_LR_PHASE1 = 1e-3
+HEAD_LR = 3e-4
+BACKBONE_LR = 3e-5
+
+EARLY_STOPPING_PATIENCE = 7
 
 # ==============================================================================
-# 3. Data Transformations & Mixup
+# 3. Transforms (derm-friendly)
 # ==============================================================================
-normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-
-train_transform = create_transform(
-    input_size=224,
-    is_training=True,
-    auto_augment='rand-m9-mstd0.5-inc1', 
-    interpolation='bicubic',
-    re_prob=0.25, 
-    re_mode='pixel',
-    re_count=1,
+normalize = transforms.Normalize(
     mean=[0.485, 0.456, 0.406],
     std=[0.229, 0.224, 0.225]
 )
 
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
+    transforms.ToTensor(),
+    normalize
+])
+
 test_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
     normalize
 ])
 
 # ==============================================================================
-# 4. Dataset Loading & Class Imbalance Handling
+# 4. Data
 # ==============================================================================
-train_dataset = datasets.ImageFolder(root=TRAIN_DIR, transform=train_transform)
-test_dataset = datasets.ImageFolder(root=TEST_DIR, transform=test_transform)
+train_dataset = datasets.ImageFolder(TRAIN_DIR, transform=train_transform)
+test_dataset = datasets.ImageFolder(TEST_DIR, transform=test_transform)
 
 NUM_CLASSES = len(train_dataset.classes)
-print(f"Loaded {len(train_dataset)} training images across {NUM_CLASSES} classes.")
 
-class_counts = [0] * NUM_CLASSES
-for _, label in train_dataset.samples:
-    class_counts[label] += 1
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=8,
+    pin_memory=True,
+    drop_last=True
+)
 
-class_weights = 1.0 / np.array(class_counts)
-sample_weights = [class_weights[label] for _, label in train_dataset.samples]
-
-sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=8, drop_last=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8)
-
-mixup_fn = Mixup(
-    mixup_alpha=0.2, cutmix_alpha=0.0, prob=1.0, switch_prob=0.0, 
-    mode='batch', label_smoothing=0.1, num_classes=NUM_CLASSES
+test_loader = DataLoader(
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=8,
+    pin_memory=True
 )
 
 # ==============================================================================
-# 5. Model Initialization & Resuming Checkpoint
+# 5. Model
 # ==============================================================================
-print("Initializing DINOv2-Large model...")
 model = timm.create_model(
-    'vit_large_patch14_dinov2.lvd142m', 
-    pretrained=True, 
+    'vit_large_patch14_dinov2.lvd142m',
+    pretrained=True,
     num_classes=NUM_CLASSES,
-    img_size=224 
+    img_size=IMG_SIZE
 )
 
-# --- RESUME LOGIC ---
-best_val_acc = 0.0
-start_epoch = 0
-checkpoint_path = "best_model.pt"
+model = model.to(device).to(memory_format=torch.channels_last)
 
-if os.path.exists(checkpoint_path):
-    print(f"✅ Found existing checkpoint: {checkpoint_path}. Resuming training!")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        if 'val_acc' in checkpoint:
-            best_val_acc = checkpoint['val_acc']
-            print(f"Resuming with previous best Validation Acc: {best_val_acc:.2f}%")
-    else:
-        model.load_state_dict(checkpoint)
-else:
-    print("No checkpoint found. Starting from scratch.")
+ema = ModelEmaV2(model, decay=0.9999)
 
-model = model.to(device)
-
-train_criterion = SoftTargetCrossEntropy()
-val_criterion = nn.CrossEntropyLoss()
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
 # ==============================================================================
-# 6. Training Loop (Phase 2 Extended with Early Stopping)
+# 6. Training Functions
 # ==============================================================================
-print(f"\n🚀 Starting Extended Fine-Tuning for {PHASE_2_EPOCHS} Epochs...")
-
-# Early Stopping State Variables
-epochs_without_improvement = 0
-stop_training = False
-
-def train_epoch(epoch, num_epochs, phase_name, optimizer, scheduler=None):
+def train_epoch(loader, optimizer):
     model.train()
-    running_loss, correct, total = 0.0, 0, 0
-    
-    for i, (inputs, labels) in enumerate(train_loader):
-        inputs, labels = inputs.to(device), labels.to(device)
-        inputs, targets = mixup_fn(inputs, labels)
-        
-        optimizer.zero_grad()
-        
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = model(inputs)
-            loss = train_criterion(outputs, targets)
-            
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
-        
-        if i % 10 == 0:
-            print(f"[{phase_name}] Epoch {epoch+1}/{num_epochs}, Step {i}/{len(train_loader)}, Loss: {loss.item():.4f}")
-            
-    if scheduler:
-        scheduler.step()
-        
-    print(f"--- Epoch {epoch+1} Train Acc (approx): {100.*correct/total:.2f}% ---")
+    total_loss = 0
 
-def validate(epoch):
-    global best_val_acc
-    global epochs_without_improvement
-    global stop_training
-    
+    for inputs, labels in loader:
+        inputs = inputs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+
+        with torch.autocast(device_type="cuda"):
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        ema.update(model)
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+def tta_predict(model, inputs):
+    # simple TTA: original + horizontal flip
+    outputs = model(inputs)
+    flipped = torch.flip(inputs, dims=[3])
+    outputs_flip = model(flipped)
+    return (outputs + outputs_flip) / 2
+
+
+def validate():
     model.eval()
-    val_correct, val_total, val_loss = 0, 0, 0.0
+    correct, total = 0, 0
+
     with torch.no_grad():
         for inputs, labels in test_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                outputs = model(inputs)
-                loss = val_criterion(outputs, labels)
-                
-            val_loss += loss.item()
+            inputs = inputs.to(device).to(memory_format=torch.channels_last)
+            labels = labels.to(device)
+
+            with torch.autocast(device_type="cuda"):
+                outputs = tta_predict(ema.module, inputs)
+
             _, predicted = outputs.max(1)
-            val_total += labels.size(0)
-            val_correct += predicted.eq(labels).sum().item()
-            
-    val_acc = 100. * val_correct / val_total
-    print(f"Validation Loss: {val_loss/len(test_loader):.4f} | Validation Acc: {val_acc:.2f}%\n")
-    
-    # --- EARLY STOPPING LOGIC ---
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
-        epochs_without_improvement = 0 # Reset the counter!
-        print(f"🌟 New best! Saving weights to best_model.pt...")
-        torch.save({
-            'model_state_dict': model.state_dict(), 
-            'class_to_idx': train_dataset.class_to_idx,
-            'val_acc': val_acc
-        }, "best_model.pt")
-    else:
-        epochs_without_improvement += 1
-        print(f"⚠️ No improvement in validation accuracy. Early stopping counter: {epochs_without_improvement}/{EARLY_STOPPING_PATIENCE}")
-        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
-            print(f"\n⛔ Early stopping triggered! Validation accuracy hasn't improved for {EARLY_STOPPING_PATIENCE} epochs.")
-            stop_training = True
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
 
-for param in model.parameters(): param.requires_grad = True
+    return 100.0 * correct / total
 
-optimizer_phase2 = optim.AdamW([
+
+# ==============================================================================
+# 7. Phase 1 (Head Training)
+# ==============================================================================
+print("\n🔹 Phase 1: Training Head")
+
+for param in model.parameters():
+    param.requires_grad = False
+
+for param in model.head.parameters():
+    param.requires_grad = True
+
+optimizer = optim.AdamW(model.head.parameters(), lr=HEAD_LR_PHASE1)
+
+best_acc = 0
+patience = 0
+
+for epoch in range(EPOCHS_PHASE1):
+    loss = train_epoch(train_loader, optimizer)
+    acc = validate()
+
+    print(f"[Phase1] Epoch {epoch+1}: Loss={loss:.4f}, Acc={acc:.2f}%")
+
+# ==============================================================================
+# 8. Phase 2 (Full Fine-Tuning)
+# ==============================================================================
+print("\n🔹 Phase 2: Full Fine-Tuning")
+
+for param in model.parameters():
+    param.requires_grad = True
+
+optimizer = optim.AdamW([
+    {'params': model.head.parameters(), 'lr': HEAD_LR},
     {'params': model.blocks.parameters(), 'lr': BACKBONE_LR},
-    {'params': model.head.parameters(), 'lr': HEAD_LR}
+    {'params': model.patch_embed.parameters(), 'lr': BACKBONE_LR},
+    {'params': model.norm.parameters(), 'lr': BACKBONE_LR},
 ])
 
-scheduler_phase2 = optim.lr_scheduler.CosineAnnealingLR(optimizer_phase2, T_max=PHASE_2_EPOCHS)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_PHASE2)
 
-for epoch in range(start_epoch, PHASE_2_EPOCHS):
-    train_epoch(epoch, PHASE_2_EPOCHS, "EXTENDED", optimizer_phase2, scheduler_phase2)
-    validate(epoch)
-    
-    if stop_training:
-        break # Exit the loop completely
+for epoch in range(EPOCHS_PHASE2):
+    loss = train_epoch(train_loader, optimizer)
+    acc = validate()
+    scheduler.step()
 
-print("\n🎉 Extended Training Complete!")
-print(f"The best weights (Validation Accuracy: {best_val_acc:.2f}%) are safely stored in 'best_model.pt'.")
+    print(f"[Phase2] Epoch {epoch+1}: Loss={loss:.4f}, Acc={acc:.2f}%")
+
+    if acc > best_acc:
+        best_acc = acc
+        patience = 0
+
+        torch.save({
+            "model": ema.module.state_dict(),
+            "acc": acc,
+            "class_to_idx": train_dataset.class_to_idx
+        }, "best_model.pt")
+
+        print(f"✅ New best: {acc:.2f}% saved")
+    else:
+        patience += 1
+        print(f"⚠️ No improvement ({patience}/{EARLY_STOPPING_PATIENCE})")
+
+        if patience >= EARLY_STOPPING_PATIENCE:
+            print("⛔ Early stopping triggered")
+            break
+
+# ==============================================================================
+# Done
+# ==============================================================================
+print(f"\n🎉 Training complete. Best accuracy: {best_acc:.2f}%")
