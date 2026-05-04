@@ -33,7 +33,7 @@ if not os.path.exists(TRAIN_DIR):
         except Exception as e:
             print(f"🚨 Failed to download dataset: {e}")
             exit(1)
-            
+
 # ==============================================================================
 # 1. ROCm / AMD GPU Setup
 # ==============================================================================
@@ -42,13 +42,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\nUsing device: {device}")
 
 # ==============================================================================
-# 2. Hyperparameters (Aligned strictly with Hackathon Project)
+# 2. Hyperparameters
 # ==============================================================================
-BATCH_SIZE = 128  # MI300X handles this easily (uses <30GB VRAM at 224px)
-PHASE_1_EPOCHS = 3
-PHASE_2_EPOCHS = 12
-HEAD_LR = 1e-3
-BACKBONE_LR = 5e-5
+BATCH_SIZE = 128  
+PHASE_1_EPOCHS = 0  
+PHASE_2_EPOCHS = 30 
+HEAD_LR = 5e-4      
+BACKBONE_LR = 1e-5  
+EARLY_STOPPING_PATIENCE = 5  # Number of epochs to wait for improvement before stopping
 
 # ==============================================================================
 # 3. Data Transformations & Mixup
@@ -91,18 +92,16 @@ sample_weights = [class_weights[label] for _, label in train_dataset.samples]
 
 sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
 
-# Note: drop_last=True is REQUIRED when using timm's Mixup, as it needs even batch sizes.
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=8, drop_last=True)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8)
 
-# Initialize Mixup (As per hackathon notes: Mixup(0.2) + label smoothing)
 mixup_fn = Mixup(
     mixup_alpha=0.2, cutmix_alpha=0.0, prob=1.0, switch_prob=0.0, 
     mode='batch', label_smoothing=0.1, num_classes=NUM_CLASSES
 )
 
 # ==============================================================================
-# 5. Model Initialization (DINOv2)
+# 5. Model Initialization & Resuming Checkpoint
 # ==============================================================================
 print("Initializing DINOv2-Large model...")
 model = timm.create_model(
@@ -111,17 +110,39 @@ model = timm.create_model(
     num_classes=NUM_CLASSES,
     img_size=224 
 )
+
+# --- RESUME LOGIC ---
+best_val_acc = 0.0
+start_epoch = 0
+checkpoint_path = "best_model.pt"
+
+if os.path.exists(checkpoint_path):
+    print(f"✅ Found existing checkpoint: {checkpoint_path}. Resuming training!")
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if 'val_acc' in checkpoint:
+            best_val_acc = checkpoint['val_acc']
+            print(f"Resuming with previous best Validation Acc: {best_val_acc:.2f}%")
+    else:
+        model.load_state_dict(checkpoint)
+else:
+    print("No checkpoint found. Starting from scratch.")
+
 model = model.to(device)
 
-# When using Mixup, we must use SoftTargetCrossEntropy for training!
 train_criterion = SoftTargetCrossEntropy()
 val_criterion = nn.CrossEntropyLoss()
 
 # ==============================================================================
-# 6. Two-Phase Training Loop
+# 6. Training Loop (Phase 2 Extended with Early Stopping)
 # ==============================================================================
-print("\n🚀 Starting Two-Phase Training on AMD MI300X...")
-best_val_acc = 0.0
+print(f"\n🚀 Starting Extended Fine-Tuning for {PHASE_2_EPOCHS} Epochs...")
+
+# Early Stopping State Variables
+epochs_without_improvement = 0
+stop_training = False
 
 def train_epoch(epoch, num_epochs, phase_name, optimizer, scheduler=None):
     model.train()
@@ -129,8 +150,6 @@ def train_epoch(epoch, num_epochs, phase_name, optimizer, scheduler=None):
     
     for i, (inputs, labels) in enumerate(train_loader):
         inputs, labels = inputs.to(device), labels.to(device)
-        
-        # Apply Mixup to the batch
         inputs, targets = mixup_fn(inputs, labels)
         
         optimizer.zero_grad()
@@ -143,8 +162,6 @@ def train_epoch(epoch, num_epochs, phase_name, optimizer, scheduler=None):
         optimizer.step()
         
         running_loss += loss.item()
-        
-        # Calculate approximate accuracy (using original hard labels, not mixup soft targets)
         _, predicted = outputs.max(1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
@@ -159,6 +176,9 @@ def train_epoch(epoch, num_epochs, phase_name, optimizer, scheduler=None):
 
 def validate(epoch):
     global best_val_acc
+    global epochs_without_improvement
+    global stop_training
+    
     model.eval()
     val_correct, val_total, val_loss = 0, 0, 0.0
     with torch.no_grad():
@@ -176,40 +196,38 @@ def validate(epoch):
     val_acc = 100. * val_correct / val_total
     print(f"Validation Loss: {val_loss/len(test_loader):.4f} | Validation Acc: {val_acc:.2f}%\n")
     
+    # --- EARLY STOPPING LOGIC ---
     if val_acc > best_val_acc:
         best_val_acc = val_acc
+        epochs_without_improvement = 0 # Reset the counter!
         print(f"🌟 New best! Saving weights to best_model.pt...")
         torch.save({
             'model_state_dict': model.state_dict(), 
-            'class_to_idx': train_dataset.class_to_idx
+            'class_to_idx': train_dataset.class_to_idx,
+            'val_acc': val_acc
         }, "best_model.pt")
+    else:
+        epochs_without_improvement += 1
+        print(f"⚠️ No improvement in validation accuracy. Early stopping counter: {epochs_without_improvement}/{EARLY_STOPPING_PATIENCE}")
+        if epochs_without_improvement >= EARLY_STOPPING_PATIENCE:
+            print(f"\n⛔ Early stopping triggered! Validation accuracy hasn't improved for {EARLY_STOPPING_PATIENCE} epochs.")
+            stop_training = True
 
-# --- PHASE 1: Linear Probe (Train Head Only) ---
-print("\n--- PHASE 1: Linear Probing (Head Only) ---")
-for param in model.parameters(): param.requires_grad = False
-for param in model.head.parameters(): param.requires_grad = True
-
-optimizer_phase1 = optim.AdamW(model.head.parameters(), lr=HEAD_LR)
-# Phase 1 is short, just use a simple Cosine Annealing
-scheduler_phase1 = optim.lr_scheduler.CosineAnnealingLR(optimizer_phase1, T_max=PHASE_1_EPOCHS)
-
-for epoch in range(PHASE_1_EPOCHS):
-    train_epoch(epoch, PHASE_1_EPOCHS, "PHASE 1", optimizer_phase1, scheduler_phase1)
-    validate(epoch)
-
-# --- PHASE 2: Full Fine-Tune (Discriminative LRs) ---
-print("\n--- PHASE 2: Full Fine-Tuning (Discriminative LRs) ---")
 for param in model.parameters(): param.requires_grad = True
 
 optimizer_phase2 = optim.AdamW([
     {'params': model.blocks.parameters(), 'lr': BACKBONE_LR},
     {'params': model.head.parameters(), 'lr': HEAD_LR}
 ])
-# Phase 2 Cosine Annealing over 12 epochs
+
 scheduler_phase2 = optim.lr_scheduler.CosineAnnealingLR(optimizer_phase2, T_max=PHASE_2_EPOCHS)
 
-for epoch in range(PHASE_2_EPOCHS):
-    train_epoch(epoch, PHASE_2_EPOCHS, "PHASE 2", optimizer_phase2, scheduler_phase2)
+for epoch in range(start_epoch, PHASE_2_EPOCHS):
+    train_epoch(epoch, PHASE_2_EPOCHS, "EXTENDED", optimizer_phase2, scheduler_phase2)
     validate(epoch)
+    
+    if stop_training:
+        break # Exit the loop completely
 
-print("🎉 Training Complete!")
+print("\n🎉 Extended Training Complete!")
+print(f"The best weights (Validation Accuracy: {best_val_acc:.2f}%) are safely stored in 'best_model.pt'.")
