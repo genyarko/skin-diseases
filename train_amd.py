@@ -48,23 +48,23 @@ print(f"VRAM available: ~{torch.cuda.get_device_properties(0).total_memory / 1e9
 # 2. Hyperparameters (192GB VRAM Optimized)
 # ==============================================================================
 IMG_SIZE = 518
-BATCH_SIZE = 128               # Crank it up — you have 192GB
-NUM_WORKERS = 16               # More workers for large batch
+BATCH_SIZE = 128               
+NUM_WORKERS = 16               
 
-PHASE_1_EPOCHS = 30            # Longer head warmup
-PHASE_2_EPOCHS = 200           # Train until convergence
+PHASE_1_EPOCHS = 30            
+PHASE_2_EPOCHS = 200           
 HEAD_LR = 1e-3
 BACKBONE_LR = 5e-6
 WEIGHT_DECAY = 0.05
-DROP_PATH = 0.2                # Aggressive regularization for 40 classes
+DROP_PATH = 0.2                
 LABEL_SMOOTHING = 0.1
 GRAD_CLIP = 1.0
-EMA_DECAY = 0.9999             # Slower EMA for stability
+EMA_DECAY = 0.9999             
 
-EARLY_STOPPING_PATIENCE = 25   # Very patient — 192GB means train properly
+EARLY_STOPPING_PATIENCE = 25   
 
 # ==============================================================================
-# 3. Transforms (Heavy Aug for Medical)
+# 3. Transforms
 # ==============================================================================
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
@@ -73,7 +73,7 @@ train_transform = create_transform(
     is_training=True,
     auto_augment='rand-m15-mstd0.5-inc1',
     interpolation='bicubic',
-    re_prob=0.5,                 # Heavy random erasing
+    re_prob=0.5,
     re_mode='pixel',
     re_count=1,
     mean=[0.485, 0.456, 0.406],
@@ -115,7 +115,7 @@ mixup_fn = Mixup(
 )
 
 # ==============================================================================
-# 5. Focal Loss for Hard Examples (adds ~1-2% on imbalanced medical data)
+# 5. Focal Loss
 # ==============================================================================
 class FocalLoss(nn.Module):
     def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
@@ -134,61 +134,47 @@ class FocalLoss(nn.Module):
         return loss
 
 # ==============================================================================
-# 6. Model: DINOv2-Giant (1.1B params) — you have the VRAM
+# 6. Model: DINOv2-Large (1024-dim) — matches your hardware, trains fast
 # ==============================================================================
-print("Initializing DINOv2-GIANT (1.1B params) at 518x518...")
+print("Initializing DINOv2-Large at 518x518...")
 
 model = timm.create_model(
-    'vit_giant_patch14_dinov2.lvd142m',   # 1.1B parameter model
+    'vit_large_patch14_dinov2.lvd142m',   # 300M params, 1024-dim
     pretrained=True, 
     num_classes=NUM_CLASSES,
     img_size=IMG_SIZE,
     drop_path_rate=DROP_PATH,
 )
 
-# --- RESUME LOGIC ---
+# --- CHECKPOINT HANDLING ---
+# Your old checkpoint is incompatible (26 classes, different training). 
+# We start fresh from pretrained ImageNet weights which is actually better.
 best_val_acc = 0.0
 best_ema_acc = 0.0
 start_epoch = 0
-checkpoint_path = "best_model.pt"
-ema_checkpoint_path = "best_ema_model.pt"
-
-if os.path.exists(checkpoint_path):
-    print(f"Found existing checkpoint: {checkpoint_path}. Resuming!")
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-        best_val_acc = checkpoint.get('val_acc', 0.0)
-    else:
-        model.load_state_dict(checkpoint)
+checkpoint_path = "best_model_derm40.pt"
+ema_checkpoint_path = "best_ema_model_derm40.pt"
 
 model = model.to(device)
 
 # EMA
 model_ema = ModelEmaV2(model, decay=EMA_DECAY, device=device)
-if os.path.exists(ema_checkpoint_path):
-    ema_ckpt = torch.load(ema_checkpoint_path, map_location='cpu')
-    if 'state_dict' in ema_ckpt:
-        model_ema.module.load_state_dict(ema_ckpt['state_dict'])
 
-# Losses
-train_criterion = SoftTargetCrossEntropy()  # For mixup/cutmix
+train_criterion = SoftTargetCrossEntropy()
 val_criterion = nn.CrossEntropyLoss()
 focal_criterion = FocalLoss(gamma=2.0)
 
 # ==============================================================================
-# 7. Layer-wise LR Decay (24 blocks for Giant? Actually Giant has 40 blocks)
+# 7. Layer-wise LR Decay (24 blocks for Large)
 # ==============================================================================
-def get_layer_wise_lr_params(model, base_lr, num_layers=40, decay=0.8):
+def get_layer_wise_lr_params(model, base_lr, num_layers=24, decay=0.75):
     parameter_groups = OrderedDict()
     
-    # Head
     parameter_groups['head'] = {
         'params': list(model.head.parameters()),
-        'lr': base_lr * 20  # 20x for fresh head
+        'lr': base_lr * 20
     }
     
-    # Embedding
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     parameter_groups['embed'] = {
         'params': [p for n, p in model.named_parameters() 
@@ -197,7 +183,6 @@ def get_layer_wise_lr_params(model, base_lr, num_layers=40, decay=0.8):
         'lr': base_lr * (decay ** (num_layers + 1))
     }
     
-    # Transformer blocks
     for i in range(num_layers):
         block_name = f'blocks.{i}'
         block_params = [p for n, p in model.named_parameters() 
@@ -225,11 +210,8 @@ def train_epoch(epoch, num_epochs, phase_name, optimizer, scheduler=None, use_fo
         
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(inputs)
-            
-            # Primary loss
             loss = train_criterion(outputs, targets)
             
-            # Optional: add focal loss on clean labels for hard examples
             if use_focal and torch.rand(1).item() > 0.5:
                 loss = 0.7 * loss + 0.3 * focal_criterion(outputs, labels)
             
@@ -323,7 +305,7 @@ for epoch in range(PHASE_1_EPOCHS):
 print(f"Phase 1 done. Best EMA: {best_ema_acc:.2f}%")
 
 # ==============================================================================
-# 10. PHASE 2: Full Fine-Tune with Layer-wise LR
+# 10. PHASE 2: Full Fine-Tune
 # ==============================================================================
 print(f"\n{'='*60}")
 print(f"PHASE 2: Full Fine-Tune (up to {PHASE_2_EPOCHS} epochs)")
@@ -332,7 +314,7 @@ print(f"{'='*60}")
 for param in model.parameters():
     param.requires_grad = True
 
-param_groups = get_layer_wise_lr_params(model, base_lr=BACKBONE_LR, num_layers=40, decay=0.8)
+param_groups = get_layer_wise_lr_params(model, base_lr=BACKBONE_LR, num_layers=24, decay=0.75)
 optimizer_p2 = optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
 scheduler_p2 = optim.lr_scheduler.CosineAnnealingLR(optimizer_p2, T_max=PHASE_2_EPOCHS)
 
