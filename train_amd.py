@@ -4,33 +4,43 @@ import zipfile
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
-import timm  # Using timm instead of torchvision.models for DINOv2
+import timm
 
 # ==============================================================================
 # 0. Automatic Dataset Download (from Kaggle)
 # ==============================================================================
 KAGGLE_DATASET = "merolavtechnology/dermnet-skin40-cleaned-dataset"
-DATA_DIR = "./dermnet-skin40-cleaned-dataset" 
+BASE_EXTRACT_DIR = "./dermnet-skin40-cleaned-dataset" 
+
+# Because Kaggle zips often preserve absolute paths
+DATA_DIR = os.path.join(BASE_EXTRACT_DIR, "kaggle/working/Merged_Dermnet_Skin40")
+
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 TEST_DIR = os.path.join(DATA_DIR, "test")
 
 print("Checking for dataset...")
 if not os.path.exists(TRAIN_DIR):
-    print(f"Dataset not found. Downloading {KAGGLE_DATASET} from Kaggle...")
-    try:
-        subprocess.run(["kaggle", "datasets", "download", "-d", KAGGLE_DATASET], check=True)
-        zip_filename = f"{KAGGLE_DATASET.split('/')[-1]}.zip"
-        print(f"Extracting {zip_filename}...")
-        with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
-            zip_ref.extractall(DATA_DIR)
-        os.remove(zip_filename)
-        print("✅ Dataset successfully downloaded and extracted!")
-    except Exception as e:
-        print(f"🚨 Failed to download dataset. Ensure 'kaggle' is installed and ~/.kaggle/kaggle.json is configured.")
-        print(f"Error: {e}")
+    print(f"Dataset not found at {TRAIN_DIR}.")
+    if not os.path.exists(BASE_EXTRACT_DIR):
+        print(f"Downloading {KAGGLE_DATASET} from Kaggle...")
+        try:
+            subprocess.run(["kaggle", "datasets", "download", "-d", KAGGLE_DATASET], check=True)
+            zip_filename = f"{KAGGLE_DATASET.split('/')[-1]}.zip"
+            print(f"Extracting {zip_filename}...")
+            with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
+                zip_ref.extractall(BASE_EXTRACT_DIR)
+            os.remove(zip_filename)
+            print("✅ Dataset successfully downloaded and extracted!")
+        except Exception as e:
+            print(f"🚨 Failed to download dataset. Ensure 'kaggle' is installed and ~/.kaggle/kaggle.json is configured.")
+            print(f"Error: {e}")
+            exit(1)
+            
+    if not os.path.exists(TRAIN_DIR):
+        print(f"🚨 Error: Extracted the zip, but could not find the train folder at: {TRAIN_DIR}")
         exit(1)
 else:
     print("✅ Dataset already exists locally.")
@@ -39,14 +49,20 @@ else:
 # 1. ROCm / AMD GPU Setup
 # ==============================================================================
 os.environ["HIP_VISIBLE_DEVICES"] = "0"
-torch.backends.miopen.enabled = True
+
+# Note: We removed the torch.backends.miopen.enabled = True flag here.
+# While it speeds up standard CNNs, it can cause AttributeError crashes on 
+# certain pre-compiled PyTorch ROCm wheels when used with massive Transformers.
+# ROCm will still utilize the GPU perfectly without it.
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\nUsing device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
 # ==============================================================================
 # 2. Hyperparameters
 # ==============================================================================
-# Lowered batch size because DINOv2 is massive compared to ResNet
 BATCH_SIZE = 32 
 EPOCHS = 10
 LEARNING_RATE = 1e-4
@@ -54,7 +70,6 @@ LEARNING_RATE = 1e-4
 # ==============================================================================
 # 3. Data Transformations
 # ==============================================================================
-# DINOv2 uses standard ImageNet normalization
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 train_transform = transforms.Compose([
@@ -96,22 +111,20 @@ test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num
 # ==============================================================================
 # 5. Model Initialization (DINOv2 via timm)
 # ==============================================================================
-print("Initializing DINOv2-Large model (Track 2 Architecture)...")
-# This pulls the exact backbone used to hit 97% in the hackathon
+print("Initializing DINOv2-Large model...")
 model = timm.create_model(
     'vit_large_patch14_dinov2.lvd142m', 
     pretrained=True, 
     num_classes=NUM_CLASSES
 )
 
-# Optional: Freeze the massive backbone and only train the new classification head initially
-# to prevent catastrophic forgetting. (You can remove this later to fine-tune the whole model)
+# CRITICAL FIX: Move the model to the AMD GPU immediately upon creation.
+model = model.to(device)
+
 for param in model.parameters():
     param.requires_grad = False
 for param in model.head.parameters():
     param.requires_grad = True
-
-model = model.to(device)
 
 # ==============================================================================
 # 6. Loss & Optimizer
@@ -123,7 +136,6 @@ optimizer = optim.Adam(model.head.parameters(), lr=LEARNING_RATE)
 # 7. Training Loop
 # ==============================================================================
 print("\n🚀 Starting Training on AMD MI300X...")
-
 best_val_acc = 0.0
 
 for epoch in range(EPOCHS):
@@ -136,7 +148,6 @@ for epoch in range(EPOCHS):
         inputs, labels = inputs.to(device), labels.to(device)
         
         optimizer.zero_grad()
-        # Use autocast for faster training on MI300X (BF16 mixed precision)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(inputs)
             loss = criterion(outputs, labels)
@@ -171,7 +182,6 @@ for epoch in range(EPOCHS):
     val_acc = 100. * val_correct / val_total
     print(f"Validation Acc: {val_acc:.2f}%\n")
     
-    # Save the best model weights!
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         print(f"🌟 New best validation accuracy! Saving weights to best_model.pt...")
@@ -180,9 +190,7 @@ for epoch in range(EPOCHS):
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'val_acc': val_acc,
-            # We save the class-to-idx mapping so the Gradio app knows what integer '0' means later
             'class_to_idx': train_dataset.class_to_idx 
         }, "best_model.pt")
 
 print("🎉 Training Complete!")
-print(f"The best model weights are saved in 'best_model.pt' (Validation Accuracy: {best_val_acc:.2f}%)")
