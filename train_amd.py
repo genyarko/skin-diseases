@@ -4,7 +4,7 @@ import zipfile
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms, models
+from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
 import timm
@@ -15,15 +15,12 @@ import timm
 KAGGLE_DATASET = "merolavtechnology/dermnet-skin40-cleaned-dataset"
 BASE_EXTRACT_DIR = "./dermnet-skin40-cleaned-dataset" 
 
-# Because Kaggle zips often preserve absolute paths
 DATA_DIR = os.path.join(BASE_EXTRACT_DIR, "kaggle/working/Merged_Dermnet_Skin40")
-
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 TEST_DIR = os.path.join(DATA_DIR, "test")
 
 print("Checking for dataset...")
 if not os.path.exists(TRAIN_DIR):
-    print(f"Dataset not found at {TRAIN_DIR}.")
     if not os.path.exists(BASE_EXTRACT_DIR):
         print(f"Downloading {KAGGLE_DATASET} from Kaggle...")
         try:
@@ -33,15 +30,9 @@ if not os.path.exists(TRAIN_DIR):
             with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
                 zip_ref.extractall(BASE_EXTRACT_DIR)
             os.remove(zip_filename)
-            print("✅ Dataset successfully downloaded and extracted!")
         except Exception as e:
-            print(f"🚨 Failed to download dataset. Ensure 'kaggle' is installed and ~/.kaggle/kaggle.json is configured.")
-            print(f"Error: {e}")
+            print(f"🚨 Failed to download dataset: {e}")
             exit(1)
-            
-    if not os.path.exists(TRAIN_DIR):
-        print(f"🚨 Error: Extracted the zip, but could not find the train folder at: {TRAIN_DIR}")
-        exit(1)
 else:
     print("✅ Dataset already exists locally.")
 
@@ -49,36 +40,36 @@ else:
 # 1. ROCm / AMD GPU Setup
 # ==============================================================================
 os.environ["HIP_VISIBLE_DEVICES"] = "0"
-
-# Note: We removed the torch.backends.miopen.enabled = True flag here.
-# While it speeds up standard CNNs, it can cause AttributeError crashes on 
-# certain pre-compiled PyTorch ROCm wheels when used with massive Transformers.
-# ROCm will still utilize the GPU perfectly without it.
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\nUsing device: {device}")
-if torch.cuda.is_available():
-    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
 # ==============================================================================
-# 2. Hyperparameters
+# 2. Hyperparameters (Aligned with Hackathon Project)
 # ==============================================================================
-BATCH_SIZE = 32 
-EPOCHS = 10
-LEARNING_RATE = 1e-4
+BATCH_SIZE = 128  # Pushing higher since MI300X has 192GB VRAM
+PHASE_1_EPOCHS = 3
+PHASE_2_EPOCHS = 12
+HEAD_LR = 1e-3
+BACKBONE_LR = 5e-5
 
 # ==============================================================================
-# 3. Data Transformations
+# 3. Data Transformations (Light RandAugment + RandomErasing)
 # ==============================================================================
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(15),
-    transforms.ToTensor(),
-    normalize
-])
+# Using Timm's advanced augmentation strategy (RandAugment)
+from timm.data import create_transform
+train_transform = create_transform(
+    input_size=224,
+    is_training=True,
+    auto_augment='rand-m9-mstd0.5-inc1', # Light RandAugment
+    interpolation='bicubic',
+    re_prob=0.25, # Random Erasing
+    re_mode='pixel',
+    re_count=1,
+    mean=[0.485, 0.456, 0.406],
+    std=[0.229, 0.224, 0.225]
+)
 
 test_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -105,8 +96,8 @@ sample_weights = [class_weights[label] for _, label in train_dataset.samples]
 
 sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=4)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=8, drop_last=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8)
 
 # ==============================================================================
 # 5. Model Initialization (DINOv2 via timm)
@@ -118,79 +109,84 @@ model = timm.create_model(
     num_classes=NUM_CLASSES
 )
 
-# CRITICAL FIX: Move the model to the AMD GPU immediately upon creation.
 model = model.to(device)
 
-for param in model.parameters():
-    param.requires_grad = False
-for param in model.head.parameters():
-    param.requires_grad = True
+# Label-smoothed cross-entropy
+criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
 # ==============================================================================
-# 6. Loss & Optimizer
+# 6. Two-Phase Training Loop
 # ==============================================================================
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.head.parameters(), lr=LEARNING_RATE)
-
-# ==============================================================================
-# 7. Training Loop
-# ==============================================================================
-print("\n🚀 Starting Training on AMD MI300X...")
+print("\n🚀 Starting Two-Phase Training on AMD MI300X...")
 best_val_acc = 0.0
 
-for epoch in range(EPOCHS):
+def train_epoch(epoch, num_epochs, phase_name, optimizer):
     model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+    running_loss, correct, total = 0.0, 0, 0
     
     for i, (inputs, labels) in enumerate(train_loader):
         inputs, labels = inputs.to(device), labels.to(device)
-        
         optimizer.zero_grad()
+        
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(inputs)
             loss = criterion(outputs, labels)
-        
+            
         loss.backward()
         optimizer.step()
         
         running_loss += loss.item()
         _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        total += labels.size(0); correct += predicted.eq(labels).sum().item()
         
-        if i % 50 == 0:
-            print(f"Epoch [{epoch+1}/{EPOCHS}], Step [{i}/{len(train_loader)}], Loss: {loss.item():.4f}")
+        if i % 10 == 0:
+            print(f"[{phase_name}] Epoch {epoch+1}/{num_epochs}, Step {i}/{len(train_loader)}, Loss: {loss.item():.4f}")
             
-    train_acc = 100. * correct / total
-    print(f"--- Epoch {epoch+1} Summary ---")
-    print(f"Train Loss: {running_loss/len(train_loader):.4f} | Train Acc: {train_acc:.2f}%")
-    
+    print(f"--- Epoch {epoch+1} Train Acc: {100.*correct/total:.2f}% ---")
+
+def validate(epoch):
+    global best_val_acc
     model.eval()
-    val_correct = 0
-    val_total = 0
+    val_correct, val_total = 0, 0
     with torch.no_grad():
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 outputs = model(inputs)
             _, predicted = outputs.max(1)
-            val_total += labels.size(0)
-            val_correct += predicted.eq(labels).sum().item()
+            val_total += labels.size(0); val_correct += predicted.eq(labels).sum().item()
             
     val_acc = 100. * val_correct / val_total
     print(f"Validation Acc: {val_acc:.2f}%\n")
     
     if val_acc > best_val_acc:
         best_val_acc = val_acc
-        print(f"🌟 New best validation accuracy! Saving weights to best_model.pt...")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_acc': val_acc,
-            'class_to_idx': train_dataset.class_to_idx 
-        }, "best_model.pt")
+        print(f"🌟 New best! Saving weights to best_model.pt...")
+        torch.save({'model_state_dict': model.state_dict(), 'class_to_idx': train_dataset.class_to_idx}, "best_model.pt")
+
+# --- PHASE 1: Linear Probe (Train Head Only) ---
+print("\n--- PHASE 1: Linear Probing (Head Only) ---")
+for param in model.parameters(): param.requires_grad = False
+for param in model.head.parameters(): param.requires_grad = True
+
+optimizer_phase1 = optim.AdamW(model.head.parameters(), lr=HEAD_LR)
+
+for epoch in range(PHASE_1_EPOCHS):
+    train_epoch(epoch, PHASE_1_EPOCHS, "PHASE 1", optimizer_phase1)
+    validate(epoch)
+
+# --- PHASE 2: Full Fine-Tune (Discriminative LRs) ---
+print("\n--- PHASE 2: Full Fine-Tuning (Discriminative LRs) ---")
+for param in model.parameters(): param.requires_grad = True
+
+# Backbone gets tiny LR, head gets larger LR
+optimizer_phase2 = optim.AdamW([
+    {'params': model.blocks.parameters(), 'lr': BACKBONE_LR},
+    {'params': model.head.parameters(), 'lr': HEAD_LR}
+])
+
+for epoch in range(PHASE_2_EPOCHS):
+    train_epoch(epoch, PHASE_2_EPOCHS, "PHASE 2", optimizer_phase2)
+    validate(epoch)
 
 print("🎉 Training Complete!")
