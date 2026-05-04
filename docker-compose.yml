@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  vllm-server:
+    # Use the official AMD/ROCm image
+    image: vllm/vllm-openai-rocm:v0.17.1
+    devices:
+      - /dev/kfd:/dev/kfd    # AMD Kernel Fusion Driver
+      - /dev/dri:/dev/dri    # Direct Rendering Infrastructure
+    group_add:
+      - video
+      - render
+    shm_size: "16g"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command: >
+      --model meta-llama/Llama-3.2-11B-Vision-Instruct
+      --host 0.0.0.0
+      --port 8000
