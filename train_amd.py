@@ -5,15 +5,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, WeightedRandomSampler
-import numpy as np
+from torch.utils.data import DataLoader
 import timm
 
-from timm.data import create_transform, Mixup
-from timm.loss import SoftTargetCrossEntropy
-
 # ==============================================================================
-# 0. Dataset Download
+# 0. Dataset
 # ==============================================================================
 KAGGLE_DATASET = "merolavtechnology/dermnet-skin40-cleaned-dataset"
 BASE_EXTRACT_DIR = "./dermnet-skin40-cleaned-dataset"
@@ -22,81 +18,66 @@ TRAIN_DIR = os.path.join(DATA_DIR, "train")
 TEST_DIR = os.path.join(DATA_DIR, "test")
 
 if not os.path.exists(TRAIN_DIR):
-    print(f"Downloading {KAGGLE_DATASET} from Kaggle...")
+    print("Downloading dataset...")
     subprocess.run(["kaggle", "datasets", "download", "-d", KAGGLE_DATASET], check=True)
     zip_filename = f"{KAGGLE_DATASET.split('/')[-1]}.zip"
     with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
         zip_ref.extractall(BASE_EXTRACT_DIR)
     os.remove(zip_filename)
 
+print("Train exists:", os.path.exists(TRAIN_DIR))
+print("Test exists:", os.path.exists(TEST_DIR))
+
 # ==============================================================================
 # 1. Device
 # ==============================================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"\nUsing device: {device}")
+print(f"Using device: {device}")
 
 # ==============================================================================
-# 2. Hyperparameters (FIXED)
+# 2. Hyperparameters
 # ==============================================================================
 BATCH_SIZE = 64
 IMG_SIZE = 224
+EPOCHS = 30
 
-EPOCHS = 40
+BACKBONE_LR = 5e-5
+HEAD_LR = 3e-4
 
-BACKBONE_LR = 1e-4
-HEAD_LR = 5e-4
-
-EARLY_STOPPING_PATIENCE = 7
+EARLY_STOPPING_PATIENCE = 5
 
 # ==============================================================================
-# 3. Transforms (RESTORED STRONG AUGMENTATION)
+# 3. Transforms (SAFE + EFFECTIVE)
 # ==============================================================================
-train_transform = create_transform(
-    input_size=IMG_SIZE,
-    is_training=True,
-    auto_augment='rand-m9-mstd0.5-inc1',
-    interpolation='bicubic',
-    re_prob=0.25,
-    re_mode='pixel',
-    re_count=1,
-    mean=[0.485, 0.456, 0.406],
-    std=[0.229, 0.224, 0.225],
-)
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.8, 1.0)),
+    transforms.RandomHorizontalFlip(),
+    transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225]),
+])
 
 test_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+                         [0.229, 0.224, 0.225]),
 ])
 
 # ==============================================================================
-# 4. Dataset + Sampler (KEEP — helps imbalance)
+# 4. Data
 # ==============================================================================
 train_dataset = datasets.ImageFolder(TRAIN_DIR, transform=train_transform)
 test_dataset = datasets.ImageFolder(TEST_DIR, transform=test_transform)
 
 NUM_CLASSES = len(train_dataset.classes)
-print(f"Loaded {len(train_dataset)} training images across {NUM_CLASSES} classes.")
-
-# Class balancing
-class_counts = [0] * NUM_CLASSES
-for _, label in train_dataset.samples:
-    class_counts[label] += 1
-
-class_weights = 1.0 / np.array(class_counts)
-sample_weights = [class_weights[label] for _, label in train_dataset.samples]
-
-sampler = WeightedRandomSampler(
-    weights=sample_weights,
-    num_samples=len(sample_weights),
-    replacement=True
-)
+print(f"Classes: {NUM_CLASSES}")
 
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
-    sampler=sampler,
+    shuffle=True,
     num_workers=8,
     pin_memory=True,
     drop_last=True
@@ -111,25 +92,9 @@ test_loader = DataLoader(
 )
 
 # ==============================================================================
-# 5. Mixup (RESTORED — CRITICAL FOR ViT)
+# 5. Model
 # ==============================================================================
-mixup_fn = Mixup(
-    mixup_alpha=0.2,
-    cutmix_alpha=0.0,
-    prob=1.0,
-    switch_prob=0.0,
-    mode='batch',
-    label_smoothing=0.1,
-    num_classes=NUM_CLASSES
-)
-
-train_criterion = SoftTargetCrossEntropy()
-val_criterion = nn.CrossEntropyLoss()
-
-# ==============================================================================
-# 6. Model
-# ==============================================================================
-print("Initializing DINOv2-Large model...")
+print("Loading DINOv2...")
 model = timm.create_model(
     'vit_large_patch14_dinov2.lvd142m',
     pretrained=True,
@@ -139,8 +104,10 @@ model = timm.create_model(
 
 model = model.to(device)
 
+criterion = nn.CrossEntropyLoss()
+
 # ==============================================================================
-# 7. Optimizer (STRONGER LR)
+# 6. Optimizer
 # ==============================================================================
 optimizer = optim.AdamW([
     {'params': model.head.parameters(), 'lr': HEAD_LR},
@@ -152,34 +119,31 @@ optimizer = optim.AdamW([
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
 # ==============================================================================
-# 8. Training Functions
+# 7. Training
 # ==============================================================================
 def train_epoch(epoch):
     model.train()
-    running_loss = 0.0
+    total_loss = 0
 
     for i, (inputs, labels) in enumerate(train_loader):
         inputs, labels = inputs.to(device), labels.to(device)
 
-        inputs, targets = mixup_fn(inputs, labels)
-
         optimizer.zero_grad()
 
-        with torch.autocast(device_type="cuda"):
-            outputs = model(inputs)
-            loss = train_criterion(outputs, targets)
+        outputs = model(inputs)
+        loss = criterion(outputs, labels)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        running_loss += loss.item()
+        total_loss += loss.item()
 
         if i % 20 == 0:
             print(f"Epoch {epoch+1}, Step {i}/{len(train_loader)}, Loss: {loss.item():.4f}")
 
     scheduler.step()
-    return running_loss / len(train_loader)
+    return total_loss / len(train_loader)
 
 
 def validate():
@@ -190,8 +154,7 @@ def validate():
         for inputs, labels in test_loader:
             inputs, labels = inputs.to(device), labels.to(device)
 
-            with torch.autocast(device_type="cuda"):
-                outputs = model(inputs)
+            outputs = model(inputs)
 
             _, predicted = outputs.max(1)
             total += labels.size(0)
@@ -201,37 +164,36 @@ def validate():
 
 
 # ==============================================================================
-# 9. Training Loop
+# 8. Loop
 # ==============================================================================
-best_acc = 0.0
+best_acc = 0
 patience = 0
 
-print("\n🚀 Training started...")
+print("\n🚀 Training...")
 
 for epoch in range(EPOCHS):
-    train_loss = train_epoch(epoch)
-    val_acc = validate()
+    loss = train_epoch(epoch)
+    acc = validate()
 
-    print(f"\nEpoch {epoch+1}: Loss={train_loss:.4f}, Val Acc={val_acc:.2f}%")
+    print(f"\nEpoch {epoch+1}: Loss={loss:.4f}, Val Acc={acc:.2f}%")
 
-    if val_acc > best_acc:
-        best_acc = val_acc
+    if acc > best_acc:
+        best_acc = acc
         patience = 0
 
         torch.save({
             'model_state_dict': model.state_dict(),
-            'val_acc': val_acc,
+            'val_acc': acc,
             'class_to_idx': train_dataset.class_to_idx
         }, "best_model.pt")
 
-        print(f"✅ New best: {val_acc:.2f}% saved")
-
+        print(f"✅ New best: {acc:.2f}% saved")
     else:
         patience += 1
         print(f"⚠️ No improvement ({patience}/{EARLY_STOPPING_PATIENCE})")
 
         if patience >= EARLY_STOPPING_PATIENCE:
-            print("⛔ Early stopping triggered")
+            print("⛔ Early stopping")
             break
 
-print(f"\n🎉 Training complete! Best accuracy: {best_acc:.2f}%")
+print(f"\n🎉 Done. Best Acc: {best_acc:.2f}%")
