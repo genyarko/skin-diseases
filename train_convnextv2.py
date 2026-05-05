@@ -37,12 +37,12 @@ TEST_DIR = os.path.join(DATA_DIR, "test")
 # Same family of CNN inductive bias, similar accuracy, far more reliable.
 MODEL_NAME = "convnext_xlarge.fb_in22k_ft_in1k_384"
 IMG_SIZE = 384
-BATCH_SIZE = 128                   # 200GB+ VRAM — plenty of room. Push to 192 only if epochs/loss look healthy
+BATCH_SIZE = 96
 OUTPUT_PATH = "convnextv2_best_ema.pt"
 
 SEED = 200                         # different seed = different sample order
 EPOCHS = 25                        # CNN convergence is similar to ViT here
-LR = 1.6e-4                        # sqrt-scaled for BS=128 (from 8e-5 @ BS=32); drop to 1.2e-4 if bouncy
+LR = 1.4e-4                        # sqrt-scaled for BS=96 (from 8e-5 @ BS=32)
 WEIGHT_DECAY = 0.05
 GRAD_CLIP = 1.0
 LABEL_SMOOTHING = 0.1
