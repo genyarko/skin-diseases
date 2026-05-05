@@ -33,14 +33,16 @@ DATA_DIR = os.path.join(BASE_EXTRACT_DIR, "kaggle/working/Merged_Dermnet_Skin40"
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 TEST_DIR = os.path.join(DATA_DIR, "test")
 
-MODEL_NAME = "convnextv2_huge.fcmae_ft_in22k_in1k_384"
+# ConvNeXt V1-XL — V2-Huge's GRN is bf16-unstable on long runs; V1 has no GRN.
+# Same family of CNN inductive bias, similar accuracy, far more reliable.
+MODEL_NAME = "convnext_xlarge.fb_in22k_ft_in1k_384"
 IMG_SIZE = 384
-BATCH_SIZE = 24                    # ConvNeXt V2-Huge is bigger; reduce if OOM
+BATCH_SIZE = 128                   # 200GB+ VRAM — plenty of room. Push to 192 only if epochs/loss look healthy
 OUTPUT_PATH = "convnextv2_best_ema.pt"
 
 SEED = 200                         # different seed = different sample order
 EPOCHS = 25                        # CNN convergence is similar to ViT here
-LR = 8.0e-5                        # ConvNeXt fine-tunes well around 5-10e-5
+LR = 1.6e-4                        # sqrt-scaled for BS=128 (from 8e-5 @ BS=32); drop to 1.2e-4 if bouncy
 WEIGHT_DECAY = 0.05
 GRAD_CLIP = 1.0
 LABEL_SMOOTHING = 0.1
