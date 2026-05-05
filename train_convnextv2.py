@@ -48,7 +48,7 @@ GRAD_CLIP = 1.0
 LABEL_SMOOTHING = 0.1
 WARMUP_FRAC = 0.1
 MIXUP_OFF_FRAC = 0.2
-EMA_DECAY = 0.9999
+EMA_DECAY = 0.999                  # 10x faster catch-up — fits a 25-epoch fine-tune
 SWA_START_FRAC = 0.8
 EARLY_STOPPING_PATIENCE = 7
 NUM_WORKERS = 4
@@ -199,25 +199,45 @@ def evaluate(eval_model, name=""):
 
 print(f"\nTraining {EPOCHS} epochs  |  warmup={warmup_steps}/{total_steps}  "
       f"|  mixup off after E{mixup_off_epoch}  |  SWA from E{swa_start_epoch}")
-best_ema_f1, best_ema_acc, no_improve = 0.0, 0.0, 0
+best_ema_f1, best_ema_acc = 0.0, 0.0
+best_live_f1, best_live_acc = 0.0, 0.0
+no_improve = 0
 swa_started = False
+LIVE_OUTPUT_PATH = "convnext_live_best.pt"
 
 for epoch in range(EPOCHS):
     t0 = time.time()
     train_epoch(epoch)
     print(f"Validation E{epoch+1}:")
-    evaluate(model, "live")
+    live_acc, live_f1 = evaluate(model, "live")
     ema_acc, ema_f1 = evaluate(ema.module, "ema ")
 
+    improved = False
+
+    if live_f1 > best_live_f1:
+        best_live_f1 = live_f1; best_live_acc = live_acc
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "class_to_idx": train_ds.class_to_idx,
+            "val_acc": live_acc, "val_macro_f1": live_f1,
+            "epoch": epoch + 1, "model_name": MODEL_NAME, "img_size": IMG_SIZE,
+        }, LIVE_OUTPUT_PATH)
+        print(f"  saved live → {LIVE_OUTPUT_PATH}")
+        improved = True
+
     if ema_f1 > best_ema_f1:
-        best_ema_f1 = ema_f1; best_ema_acc = ema_acc; no_improve = 0
+        best_ema_f1 = ema_f1; best_ema_acc = ema_acc
         torch.save({
             "model_state_dict": ema.module.state_dict(),
             "class_to_idx": train_ds.class_to_idx,
             "val_acc": ema_acc, "val_macro_f1": ema_f1,
             "epoch": epoch + 1, "model_name": MODEL_NAME, "img_size": IMG_SIZE,
         }, OUTPUT_PATH)
-        print(f"  saved → {OUTPUT_PATH}")
+        print(f"  saved ema  → {OUTPUT_PATH}")
+        improved = True
+
+    if improved:
+        no_improve = 0
     else:
         no_improve += 1
         if no_improve >= EARLY_STOPPING_PATIENCE:
@@ -241,4 +261,7 @@ if swa_started:
         "model_name": MODEL_NAME, "img_size": IMG_SIZE,
     }, "convnextv2_swa.pt")
 
-print(f"\nDone. Best EMA F1={best_ema_f1:.4f} acc={best_ema_acc*100:.2f}%  →  {OUTPUT_PATH}")
+print(f"\nDone.")
+print(f"  Best LIVE F1={best_live_f1:.4f} acc={best_live_acc*100:.2f}%  →  {LIVE_OUTPUT_PATH}")
+print(f"  Best EMA  F1={best_ema_f1:.4f} acc={best_ema_acc*100:.2f}%  →  {OUTPUT_PATH}")
+print(f"  Use whichever is higher (likely LIVE since this is a 25-epoch fine-tune from random head).")
